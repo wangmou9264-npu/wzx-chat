@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: claude-clone
+    runtime: python
+    plan: free
+    buildCommand: "cd backend && pip install -r requirements.txt"
+    startCommand: "cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: SANDBOX_ENABLED
+        value: "false"
+      - key: DATABASE_PATH
+        value: "/opt/render/project/src/data/claude.db"
+      - key: FRONTEND_DIST
+        value: "/opt/render/project/src/frontend/dist"
+      - key: HOST
+        value: "0.0.0.0"
+    healthCheckPath: /
+    autoDeploy: yes

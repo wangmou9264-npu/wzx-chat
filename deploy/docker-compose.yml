@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: claude-clone-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - DATABASE_PATH=/data/claude.db
+      - SANDBOX_ENABLED=true
+      - SANDBOX_IMAGE=claude-sandbox
+    volumes:
+      - backend-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock  # 沙盒需要Docker socket
+    networks:
+      - claude-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: claude-clone-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - claude-network
+
+  sandbox:
+    build:
+      context: ../backend/sandbox
+      dockerfile: Dockerfile
+    image: claude-sandbox
+    container_name: claude-sandbox-builder
+    # 此服务仅用于构建沙盒镜像，构建后退出
+    entrypoint: ["echo", "Sandbox image built successfully"]
+
+networks:
+  claude-network:
+    driver: bridge
+
+volumes:
+  backend-data:
