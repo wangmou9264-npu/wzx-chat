@@ -38,8 +38,6 @@ export const api = {
     ),
 }
 
-export function getWsUrl(conversationId: string): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const host = window.location.host
-  return `${protocol}//${host}/ws/chat/${conversationId}`
+export function getSseUrl(conversationId: string): string {
+  return `/api/chat/stream/${conversationId}`
 }

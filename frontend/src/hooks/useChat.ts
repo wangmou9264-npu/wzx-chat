@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
-import type { Message, WsServerEvent, WsClientMessage } from '../types'
-import { getWsUrl } from '../lib/api'
+import type { Message, WsServerEvent } from '../types'
+import { getSseUrl } from '../lib/api'
 import { uid } from '../lib/utils'
 
 interface UseChatOptions {
@@ -13,8 +13,7 @@ export function useChat({ conversationId, model, onFirstMessage }: UseChatOption
   const [messages, setMessages] = useState<Message[]>([])
   const [isStreaming, setIsStreaming] = useState(false)
   const [wsError, setWsError] = useState<string | null>(null)
-  const wsRef = useRef<WebSocket | null>(null)
-  const reconnectRef = useRef<number | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
   const streamingMsgRef = useRef<Message | null>(null)
   const hasFirstMessageRef = useRef(false)
 
@@ -24,26 +23,17 @@ export function useChat({ conversationId, model, onFirstMessage }: UseChatOption
     setIsStreaming(false)
     setWsError(null)
     hasFirstMessageRef.current = false
-    if (wsRef.current) {
-      wsRef.current.close()
-      wsRef.current = null
-    }
-    if (reconnectRef.current) {
-      window.clearTimeout(reconnectRef.current)
-      reconnectRef.current = null
+    if (abortRef.current) {
+      abortRef.current.abort()
+      abortRef.current = null
     }
   }, [conversationId])
 
-  const cleanupWs = useCallback(() => {
-    if (wsRef.current) {
-      wsRef.current.onclose = null
-      wsRef.current.close()
-      wsRef.current = null
-    }
-  }, [])
-
   const stopStreaming = useCallback(() => {
-    cleanupWs()
+    if (abortRef.current) {
+      abortRef.current.abort()
+      abortRef.current = null
+    }
     setIsStreaming(false)
     if (streamingMsgRef.current) {
       setMessages((prev) =>
@@ -55,7 +45,7 @@ export function useChat({ conversationId, model, onFirstMessage }: UseChatOption
       )
       streamingMsgRef.current = null
     }
-  }, [cleanupWs])
+  }, [])
 
   const sendMessage = useCallback(
     (content: string) => {
@@ -100,7 +90,7 @@ export function useChat({ conversationId, model, onFirstMessage }: UseChatOption
               m.id === aiMsg.id
                 ? {
                     ...m,
-                    content: '这是一个本地对话示例。连接后端服务后，AI 回复将通过 WebSocket 流式返回。',
+                    content: '这是一个本地对话示例。连接后端服务后，AI 回复将通过 SSE 流式返回。',
                     status: 'done',
                   }
                 : m
@@ -112,109 +102,133 @@ export function useChat({ conversationId, model, onFirstMessage }: UseChatOption
         return
       }
 
-      // Connect WebSocket
-      try {
-        const wsUrl = getWsUrl(conversationId)
-        const ws = new WebSocket(wsUrl)
-        wsRef.current = ws
+      // SSE fetch streaming
+      const controller = new AbortController()
+      abortRef.current = controller
 
-        ws.onopen = () => {
-          const payload: WsClientMessage = {
-            type: 'message',
-            content: content.trim(),
-            model,
+      ;(async () => {
+        try {
+          const res = await fetch(getSseUrl(conversationId), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              content: content.trim(),
+              model,
+              images: [],
+            }),
+            signal: controller.signal,
+          })
+
+          if (!res.ok) {
+            const text = await res.text()
+            throw new Error(`HTTP ${res.status}: ${text}`)
           }
-          ws.send(JSON.stringify(payload))
-        }
 
-        ws.onmessage = (event) => {
-          try {
-            const data: WsServerEvent = JSON.parse(event.data)
-            const aiId = streamingMsgRef.current?.id
+          const reader = res.body!.getReader()
+          const decoder = new TextDecoder()
+          let buffer = ''
 
-            switch (data.type) {
-              case 'thinking':
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === aiId
-                      ? { ...m, thinking: (m.thinking || '') + data.content }
-                      : m
-                  )
-                )
-                break
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
 
-              case 'token':
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === aiId
-                      ? { ...m, content: m.content + data.content }
-                      : m
-                  )
-                )
-                break
+            buffer += decoder.decode(value, { stream: true })
 
-              case 'done':
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === aiId ? { ...m, status: 'done' as const } : m
-                  )
-                )
-                streamingMsgRef.current = null
-                setIsStreaming(false)
-                cleanupWs()
-                break
+            // SSE events are separated by double newline
+            const parts = buffer.split('\n\n')
+            buffer = parts.pop() || ''
 
-              case 'error':
-                setWsError(data.message)
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === aiId
-                      ? {
-                          ...m,
-                          content: m.content || `[错误] ${data.message}`,
-                          status: 'error' as const,
-                        }
-                      : m
-                  )
-                )
-                streamingMsgRef.current = null
-                setIsStreaming(false)
-                cleanupWs()
-                break
+            for (const part of parts) {
+              const lines = part.split('\n')
+              for (const line of lines) {
+                if (!line.startsWith('data: ')) continue
+                const jsonStr = line.slice(6)
+                if (!jsonStr.trim()) continue
+
+                try {
+                  const data: WsServerEvent = JSON.parse(jsonStr)
+                  const aiId = streamingMsgRef.current?.id
+
+                  switch (data.type) {
+                    case 'thinking':
+                      setMessages((prev) =>
+                        prev.map((m) =>
+                          m.id === aiId
+                            ? { ...m, thinking: (m.thinking || '') + data.content }
+                            : m
+                        )
+                      )
+                      break
+
+                    case 'token':
+                      setMessages((prev) =>
+                        prev.map((m) =>
+                          m.id === aiId
+                            ? { ...m, content: m.content + data.content }
+                            : m
+                        )
+                      )
+                      break
+
+                    case 'done':
+                      setMessages((prev) =>
+                        prev.map((m) =>
+                          m.id === aiId ? { ...m, status: 'done' as const } : m
+                        )
+                      )
+                      streamingMsgRef.current = null
+                      setIsStreaming(false)
+                      break
+
+                    case 'error':
+                      setWsError(data.message)
+                      setMessages((prev) =>
+                        prev.map((m) =>
+                          m.id === aiId
+                            ? {
+                                ...m,
+                                content: m.content || `[错误] ${data.message}`,
+                                status: 'error' as const,
+                              }
+                            : m
+                        )
+                      )
+                      streamingMsgRef.current = null
+                      setIsStreaming(false)
+                      break
+                  }
+                } catch (e) {
+                  console.error('Failed to parse SSE event:', e, jsonStr)
+                }
+              }
             }
-          } catch (e) {
-            console.error('Failed to parse WS message:', e)
           }
-        }
-
-        ws.onerror = () => {
-          setWsError('连接错误，请检查后端服务是否运行')
-        }
-
-        ws.onclose = (ev) => {
-          if (streamingMsgRef.current && !ev.wasClean) {
-            setWsError('连接断开，正在尝试重连…')
-            // Auto-reconnect once
-            reconnectRef.current = window.setTimeout(() => {
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === streamingMsgRef.current?.id
-                    ? { ...m, status: 'done' as const }
-                    : m
-                )
-              )
-              streamingMsgRef.current = null
-              setIsStreaming(false)
-            }, 2000)
+        } catch (e: any) {
+          if (e.name === 'AbortError') {
+            // User stopped streaming, already handled
+            return
           }
+          console.error('SSE fetch error:', e)
+          setWsError(e instanceof Error ? e.message : '连接失败')
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === streamingMsgRef.current?.id
+                ? {
+                    ...m,
+                    content: m.content || `[错误] ${e instanceof Error ? e.message : '连接失败'}`,
+                    status: 'error' as const,
+                  }
+                : m
+            )
+          )
+          streamingMsgRef.current = null
+          setIsStreaming(false)
+        } finally {
+          abortRef.current = null
         }
-      } catch (e) {
-        setWsError(e instanceof Error ? e.message : '连接失败')
-        setIsStreaming(false)
-        streamingMsgRef.current = null
-      }
+      })()
     },
-    [conversationId, isStreaming, model, onFirstMessage, cleanupWs]
+    [conversationId, isStreaming, model, onFirstMessage]
   )
 
   // Load messages from conversation detail

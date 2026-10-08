@@ -49,7 +49,7 @@ app.add_middleware(
 )
 
 # 注册路由
-app.include_router(chat.router)            # WebSocket /ws/chat/{id}
+app.include_router(chat.router)            # SSE /api/chat/stream/{id}
 app.include_router(conversations.router)   # /api/conversations
 app.include_router(models.router)          # /api/models
 app.include_router(sandbox.router)         # /api/sandbox/run
